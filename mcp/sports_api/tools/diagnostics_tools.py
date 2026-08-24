@@ -4,8 +4,9 @@ Diagnostics MCP Tools
 Introspection tools for API quota, key health, and cache stats. Neither
 tool makes an upstream call, so both cost no quota.
 
-`register_diagnostics_tools(mcp, response_cache, odds_handler, dashboard_tool_names)`
-attaches every tool in this module to the given FastMCP instance.
+`register_diagnostics_tools(mcp, response_cache, odds_handler,
+dashboard_tool_names, tennis_handler=None)` attaches every tool in this module
+to the given FastMCP instance.
 """
 
 import logging
@@ -19,6 +20,7 @@ def register_diagnostics_tools(
     response_cache,
     odds_handler,
     dashboard_tool_names: List[str],
+    tennis_handler=None,
 ) -> None:
     """Attach the diagnostics tools to `mcp`.
 
@@ -29,6 +31,10 @@ def register_diagnostics_tools(
             not configured
         dashboard_tool_names: Names of the dashboard tools registered
             (empty when DASHBOARD_API_KEY is not configured)
+        tennis_handler: A TennisAPIHandler instance, or None if TENNIS_API_KEY
+            is not configured. When present, its per-minute and daily-quota
+            state is folded into get_api_status from tracked state (no upstream
+            call, so get_api_status stays quota-free).
     """
 
     @mcp.tool()
@@ -49,6 +55,10 @@ def register_diagnostics_tools(
                   invalid    — rejected as a bad key; retired for this session
               cache: hit rate, entry count, and upstream requests avoided
               dashboard: whether the BetTrack dashboard tools are registered
+              tennis_api: when TENNIS_API_KEY is set, the Live Tennis API key's
+                  per-minute budget and last observed daily quota (masked key,
+                  daily_exhausted flag, reset time). Reported from tracked
+                  state, so it too costs no quota.
 
         Example:
             get_api_status() -> {"odds_api": {...}, "cache": {...}}
@@ -70,6 +80,19 @@ def register_diagnostics_tools(
             }
 
         status["espn_api"] = {"configured": True, "requires_key": False}
+
+        if tennis_handler:
+            # Reported from tracked state (token bucket + last observed daily
+            # usage / a prior 429), so this costs no quota. `/usage` itself is
+            # free-tier; call get_tennis_* activity or the handler's get_usage
+            # to refresh the daily figures.
+            status["tennis_api"] = tennis_handler.get_quota_status()
+        else:
+            status["tennis_api"] = {
+                "configured": False,
+                "note": "TENNIS_API_KEY is not set. Tennis tools are not registered.",
+            }
+
         return status
 
     @mcp.tool()

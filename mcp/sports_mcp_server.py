@@ -9,9 +9,10 @@ Model Context Protocol server providing access to sports data from:
 Supports natural language queries for sports information.
 
 Tool definitions live in sports_api/tools/, grouped by the API they call
-(odds_tools, espn_tools, format_tools, artifact_tools, diagnostics_tools).
-This file is the composition root: it loads configuration, builds the
-shared handlers and cache, and registers each tool group against them.
+(odds_tools, espn_tools, tennis_tools, format_tools, artifact_tools,
+diagnostics_tools). This file is the composition root: it loads configuration,
+builds the shared handlers and cache, and registers each tool group against
+them.
 """
 
 import os
@@ -23,10 +24,12 @@ from mcp.server import FastMCP
 # Import API handlers
 from sports_api.odds_api_handler import OddsAPIHandler
 from sports_api.espn_api_handler import ESPNAPIHandler
+from sports_api.tennis_api_handler import TennisAPIHandler
 from sports_api.cache import ResponseCache
 from sports_api.tools import (
     register_odds_tools,
     register_espn_tools,
+    register_tennis_tools,
     register_format_tools,
     register_artifact_tools,
     register_diagnostics_tools,
@@ -93,7 +96,7 @@ if odds_api_key_str:
         odds_api_keys = keys[0]  # Single key as string
     else:
         odds_api_keys = keys  # Multiple keys, drained one at a time
-        logger.info(f"🎲 Easter egg activated! {len(keys)} API keys loaded")
+        logger.info(f"\U0001F3B2 Easter egg activated! {len(keys)} API keys loaded")
 
 # Load bookmaker configuration
 bookmakers_filter_str = os.getenv("BOOKMAKERS_FILTER", "").strip()
@@ -151,6 +154,18 @@ espn_ttls = {
     "scoreboard": _env_int("CACHE_TTL_SCOREBOARD", 30),
     "summary": _env_int("CACHE_TTL_SCOREBOARD", 30),
 }
+# Tennis live TTL is the free-tier survival knob: at 30s, following one match
+# is ~360 requests against a free key's 100/day; a larger value keeps a day of
+# casual score-checking inside the free allowance. See .env.example.
+tennis_ttls = {
+    "live": _env_int("CACHE_TTL_TENNIS_LIVE", 30),
+    "fixtures": _env_int("CACHE_TTL_TENNIS_FIXTURES", 300),
+    "player": _env_int("CACHE_TTL_TENNIS_PLAYER", 3600),
+    # /usage is the free recovery read; keep it short so a park re-check is
+    # never served from a raised (up to 900s) live cache. Independent of
+    # CACHE_TTL_TENNIS_LIVE on purpose.
+    "usage": _env_int("CACHE_TTL_TENNIS_USAGE", 15),
+}
 
 if cache_enabled:
     logger.info(
@@ -168,6 +183,24 @@ odds_handler = OddsAPIHandler(
     ttls=odds_ttls,
 ) if odds_api_keys else None
 espn_handler = ESPNAPIHandler(cache=response_cache, ttls=espn_ttls)
+
+# Live Tennis API handler, gated on TENNIS_API_KEY. Without a key we build no
+# handler and register no tools, so a user who only wants US team sports never
+# sees tennis tools that could only fail for them. The handler carries its own
+# per-minute token bucket and daily-quota tracking rather than routing through
+# the Odds key manager, which models a different quota shape.
+tennis_api_key = os.getenv("TENNIS_API_KEY", "").strip()
+if not tennis_api_key:
+    logger.info(
+        "TENNIS_API_KEY not set. Tennis tools are unavailable; other sports "
+        "tools work normally. Get a free key at "
+        "https://livetennisapi.com/subscribe/free to enable them."
+    )
+tennis_handler = (
+    TennisAPIHandler(api_key=tennis_api_key, cache=response_cache, ttls=tennis_ttls)
+    if tennis_api_key
+    else None
+)
 
 
 # ============================================================================
@@ -211,9 +244,12 @@ except ImportError as exc:
 
 register_odds_tools(mcp, odds_handler)
 register_espn_tools(mcp, espn_handler)
+register_tennis_tools(mcp, tennis_handler)
 register_format_tools(mcp, espn_handler, odds_handler)
 register_artifact_tools(mcp, odds_handler)
-register_diagnostics_tools(mcp, response_cache, odds_handler, dashboard_tool_names)
+register_diagnostics_tools(
+    mcp, response_cache, odds_handler, dashboard_tool_names, tennis_handler
+)
 
 
 # ============================================================================
@@ -224,6 +260,7 @@ if __name__ == "__main__":
     logger.info("Starting Sports Data MCP Server...")
     logger.info(f"Odds API configured: {odds_handler is not None}")
     logger.info(f"ESPN API configured: True")
+    logger.info(f"Tennis API configured: {tennis_handler is not None}")
     logger.info(f"Dashboard configured: {len(dashboard_tool_names) > 0}")
     logger.info(f"Response cache: {'enabled' if cache_enabled else 'disabled'}")
     if odds_handler and len(odds_handler.api_keys) > 1:

@@ -21,6 +21,7 @@ import pytest
 from sports_api.tools import (
     register_odds_tools,
     register_espn_tools,
+    register_tennis_tools,
     register_format_tools,
     register_artifact_tools,
     register_diagnostics_tools,
@@ -144,6 +145,84 @@ class TestRegisterEspnTools:
         assert result == {"success": False, "error": "boom"}
 
 
+class TestRegisterTennisTools:
+    def test_no_key_registers_nothing(self):
+        # Gated on TENNIS_API_KEY: with no handler, nothing is registered, so a
+        # user without a tennis key is never shown tools that can only fail.
+        mcp = FakeMCP()
+        register_tennis_tools(mcp, tennis_handler=None)
+        assert mcp.tools == {}
+
+    def test_registers_expected_tools_with_handler(self):
+        mcp = FakeMCP()
+        register_tennis_tools(mcp, tennis_handler=MagicMock())
+        assert set(mcp.tools) == {
+            "get_tennis_scoreboard",
+            "get_tennis_match_score",
+            "get_tennis_fixtures",
+            "get_tennis_player",
+        }
+
+    @pytest.mark.asyncio
+    async def test_scoreboard_summarizes_and_derives_break_point(self):
+        handler = MagicMock()
+        handler.get_live_matches = AsyncMock(return_value={
+            "success": True,
+            "cached": False,
+            "data": {
+                "data": [
+                    {
+                        "id": "m_1",
+                        "tour": "atp",
+                        "status": "live",
+                        "players": {
+                            "p1": {"id": "p_a", "name": "Player A"},
+                            "p2": {"id": "p_b", "name": "Player B"},
+                        },
+                        "score": {
+                            "sets": [1, 0],
+                            "games": [[6, 4], [3, 2]],
+                            "points": ["30", "40"],  # receiver (p2) 40 vs server 30
+                            "server": 1,
+                        },
+                    }
+                ]
+            },
+        })
+        mcp = FakeMCP()
+        register_tennis_tools(mcp, tennis_handler=handler)
+
+        result = await mcp.tools["get_tennis_scoreboard"](tour="atp")
+
+        handler.get_live_matches.assert_awaited_once_with(tour="atp", status="live", limit=20)
+        assert result["success"] is True
+        assert result["count"] == 1
+        match = result["matches"][0]
+        assert match["players"]["p1"]["name"] == "Player A"
+        assert match["score"]["server"] == 1
+        # Derived from the documented rule: receiver at 40 vs server at 30.
+        assert match["score"]["break_point"] is True
+
+    @pytest.mark.asyncio
+    async def test_scoreboard_rejects_unknown_tour(self):
+        mcp = FakeMCP()
+        register_tennis_tools(mcp, tennis_handler=MagicMock())
+
+        result = await mcp.tools["get_tennis_scoreboard"](tour="cricket")
+        assert result["success"] is False
+        assert "cricket" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_failure_passthrough(self):
+        handler = MagicMock()
+        handler.get_player = AsyncMock(return_value={"success": False, "error": "boom"})
+        mcp = FakeMCP()
+        register_tennis_tools(mcp, tennis_handler=handler)
+
+        result = await mcp.tools["get_tennis_player"]("p_x")
+        assert result == {"success": False, "error": "boom"}
+
+
 class TestRegisterFormatTools:
     def test_registers_expected_tools(self):
         mcp = FakeMCP()
@@ -245,6 +324,32 @@ class TestRegisterDiagnosticsTools:
         status = mcp.tools["get_api_status"]()
         assert status["odds_api"]["configured"] is False
         assert status["dashboard"]["tools_registered"] == 1
+        # No tennis handler passed -> reported as not configured.
+        assert status["tennis_api"]["configured"] is False
+
+    def test_get_api_status_folds_in_tennis_quota(self):
+        cache = MagicMock()
+        cache.stats.return_value = {"hits": 0}
+        tennis = MagicMock()
+        tennis.get_quota_status.return_value = {
+            "configured": True,
+            "key": "twjp...key",
+            "daily_exhausted": False,
+        }
+        mcp = FakeMCP()
+        register_diagnostics_tools(
+            mcp,
+            response_cache=cache,
+            odds_handler=None,
+            dashboard_tool_names=[],
+            tennis_handler=tennis,
+        )
+
+        status = mcp.tools["get_api_status"]()
+        # Folded from tracked state, so it costs no upstream call.
+        tennis.get_quota_status.assert_called_once_with()
+        assert status["tennis_api"]["configured"] is True
+        assert status["tennis_api"]["daily_exhausted"] is False
 
     def test_clear_cache(self):
         cache = MagicMock()
