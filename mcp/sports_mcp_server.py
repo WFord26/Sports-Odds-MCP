@@ -161,6 +161,10 @@ tennis_ttls = {
     "live": _env_int("CACHE_TTL_TENNIS_LIVE", 30),
     "fixtures": _env_int("CACHE_TTL_TENNIS_FIXTURES", 300),
     "player": _env_int("CACHE_TTL_TENNIS_PLAYER", 3600),
+    # /usage is the free recovery read; keep it short so a park re-check is
+    # never served from a raised (up to 900s) live cache. Independent of
+    # CACHE_TTL_TENNIS_LIVE on purpose.
+    "usage": _env_int("CACHE_TTL_TENNIS_USAGE", 15),
 }
 
 if cache_enabled:

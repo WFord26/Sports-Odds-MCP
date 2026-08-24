@@ -63,7 +63,14 @@ DEFAULT_TTLS = {
     "live": 30,       # live match list and single-match score
     "fixtures": 300,  # upcoming schedule
     "player": 3600,   # player profile, ranking, Elo
+    "usage": 15,      # /usage recovery read — kept short on purpose (see below)
 }
+
+# /usage is the documented recovery call: it is free, it does not spend the
+# daily allowance, and it is the only way to check a locally-guessed daily park
+# against the API's own count. It gets its OWN short TTL rather than sharing
+# `live` (which the composition root may raise to 900s as the survival knob), so
+# a recovery check is never answered from a 15-minute-old cache.
 
 # Free-tier limits, used as defaults for the minute limiter. Basic/Pro raise
 # the per-minute rate; the daily allowance is enforced by the API and observed
@@ -77,6 +84,135 @@ def _next_utc_midnight(now: Optional[datetime] = None) -> datetime:
     now = now or datetime.now(timezone.utc)
     tomorrow = (now + timedelta(days=1)).date()
     return datetime(tomorrow.year, tomorrow.month, tomorrow.day, tzinfo=timezone.utc)
+
+
+# A 429 can mean either the per-minute OR the per-day window was exceeded. The
+# process-local token bucket starts full, so a restart mid-minute — or a second
+# client sharing the key — sends a request the bucket thinks is within budget
+# but the API rejects as a MINUTE burst. Parking the daily quota on that wastes
+# ~90 of the day's 100 requests until UTC midnight. So a 429 is classified
+# before it is allowed to park the day: only a genuine daily 429 parks, and
+# everything ambiguous is treated as a minute-scale back-off (a wrong minute
+# back-off costs ~2 seconds; a wrong daily park costs the rest of the day).
+_MINUTE_SCALE_MAX_SECONDS = 120
+
+
+def _to_int(value) -> Optional[int]:
+    """Best-effort int parse; returns None on anything non-numeric."""
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_retry_after(value: Optional[str], now: Optional[datetime] = None) -> Optional[float]:
+    """Parse a Retry-After header to seconds-from-now.
+
+    Handles both documented forms: delta-seconds ("120") and an HTTP-date
+    ("Wed, 21 Oct 2026 07:28:00 GMT"). Returns None when absent or unparseable.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return max(0.0, float(text))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return max(0.0, (when - now).total_seconds())
+
+
+def _classify_rate_limit(headers, body_text: str, now: Optional[datetime] = None) -> Dict[str, object]:
+    """Classify a 429 as ``minute``-scale or ``daily``-scale.
+
+    Signals are consulted strongest-first: an explicit rate-limit scope/window
+    header, then per-window ``remaining`` headers, then the response body
+    wording, then the magnitude of Retry-After. When nothing positively says
+    "daily", the answer is ``minute`` — the safe default, because only a
+    genuine daily 429 should park the key until reset.
+
+    Args:
+        headers: The response headers (aiohttp CIMultiDict or a plain dict).
+        body_text: The 429 response body.
+        now: Injectable clock for Retry-After date math (testing).
+
+    Returns:
+        ``{"scale", "retry_after_seconds", "signal"}``.
+    """
+    # Normalise to a case-insensitive lookup that works for both aiohttp's
+    # CIMultiDict and a plain dict passed by a unit test.
+    lowered: Dict[str, object] = {}
+    if headers:
+        try:
+            items = list(headers.items())
+        except AttributeError:
+            items = []
+        for k, v in items:
+            lowered[str(k).lower()] = v
+
+    def h(*names):
+        for n in names:
+            v = lowered.get(n.lower())
+            if v is not None:
+                return v
+        return None
+
+    retry_after = _parse_retry_after(h("Retry-After"), now=now)
+    body = (body_text or "").lower()
+
+    def result(scale: str, signal: str) -> Dict[str, object]:
+        return {"scale": scale, "retry_after_seconds": retry_after, "signal": signal}
+
+    # 1. Explicit scope/window header, e.g. "X-RateLimit-Scope: minute".
+    scope = h("X-RateLimit-Scope", "RateLimit-Scope", "X-RateLimit-Window", "RateLimit-Window")
+    if scope is not None:
+        s = str(scope).lower()
+        if any(w in s for w in ("day", "daily", "date")):
+            return result("daily", f"scope={scope}")
+        if any(w in s for w in ("min", "sec", "burst")):
+            return result("minute", f"scope={scope}")
+
+    # 2. Per-window remaining headers. A day window at 0 is daily; a minute
+    #    window at 0 while the day still has room is minute-scale.
+    day_remaining = _to_int(
+        h("X-RateLimit-Remaining-Day", "X-RateLimit-Daily-Remaining", "X-RateLimit-Remaining-Daily")
+    )
+    min_remaining = _to_int(
+        h("X-RateLimit-Remaining-Minute", "X-RateLimit-Remaining-Min")
+    )
+    if day_remaining is not None and day_remaining <= 0:
+        return result("daily", "day-remaining<=0")
+    if min_remaining is not None and min_remaining <= 0 and (day_remaining is None or day_remaining > 0):
+        return result("minute", "minute-remaining<=0")
+
+    # 3. Body wording. Check the daily vocabulary first so "daily rate limit"
+    #    is read as daily rather than tripping the generic minute markers.
+    if any(w in body for w in ("per day", "daily", "day limit", "quota exceeded", "requests/day")):
+        return result("daily", "body=daily")
+    if any(w in body for w in ("per minute", "per-minute", "minute", "per second", "rate limit", "too many", "slow down")):
+        return result("minute", "body=minute")
+
+    # 4. Retry-After magnitude: a back-off longer than a minute window is
+    #    day-scale; a short one is a minute burst.
+    if retry_after is not None and retry_after > _MINUTE_SCALE_MAX_SECONDS:
+        return result("daily", "retry-after-large")
+
+    # 5. Default: minute-scale (see module note above).
+    return result("minute", "default-minute")
 
 
 class TokenBucket:
@@ -126,6 +262,21 @@ class TokenBucket:
         if deficit <= 0:
             return 0.0
         return round(deficit / self.rate_per_second, 1)
+
+    def penalize(self, seconds: float = 0.0) -> None:
+        """Empty the bucket, optionally holding it empty for `seconds`.
+
+        Called when the API reports a minute-scale 429 the local bucket did not
+        predict — a restart reset it to full, or a second client shares the key.
+        Draining aligns the local view with reality so we stop hammering for the
+        rest of the window instead of re-issuing on the next full-bucket tick.
+        `seconds` (e.g. a Retry-After hint) pushes the bucket negative so the
+        next token is not available until roughly that long from now.
+        """
+        self._refill()
+        self._tokens = 0.0
+        if seconds and seconds > 0:
+            self._tokens = -max(0.0, float(seconds)) * self.rate_per_second
 
 
 class TennisAPIHandler:
@@ -247,10 +398,21 @@ class TennisAPIHandler:
         if recorded:
             self._usage = recorded
 
-        # A reported zero remaining is the same signal as a 429: stop spending.
+        # The reported remaining count is authoritative in BOTH directions:
+        #   * <= 0 is the same signal as a daily 429 — park the key.
+        #   * > 0 means the key is usable right now, so clear any park. This is
+        #     what makes /usage a real recovery call: if a 429 was misclassified
+        #     as daily exhaustion, the API's own count releases the key.
         try:
-            if remaining is not None and int(remaining) <= 0:
-                self._mark_daily_exhausted()
+            if remaining is not None:
+                if int(remaining) <= 0:
+                    self._mark_daily_exhausted()
+                elif self._daily_exhausted_until is not None:
+                    logger.info(
+                        "Live Tennis API reports %s requests remaining; clearing daily park",
+                        remaining,
+                    )
+                    self._daily_exhausted_until = None
         except (TypeError, ValueError):
             pass
 
@@ -267,12 +429,21 @@ class TennisAPIHandler:
         """Never cache a failure; a blip would become a full TTL of failure."""
         return bool(result.get("success"))
 
-    async def _make_request(self, endpoint: str, params: Dict = None, cache_kind: str = "live") -> Dict:
+    async def _make_request(
+        self,
+        endpoint: str,
+        params: Dict = None,
+        cache_kind: str = "live",
+        bypass_daily_gate: bool = False,
+    ) -> Dict:
         """Make a request, serving from cache when possible.
 
         The API key is deliberately excluded from the cache key: the payload is
         identical whichever key fetched it, and keying on it would throw the
         cache away on rotation. Cache hits carry `"cached": True`.
+
+        `bypass_daily_gate` lets the free `/usage` recovery read reach the API
+        even while the key is locally parked (see get_usage / _fetch).
         """
         params = dict(params or {})
         key = make_key("tennis", endpoint, params)
@@ -281,7 +452,7 @@ class TennisAPIHandler:
         result, was_hit = await self.cache.get_or_fetch(
             key,
             ttl,
-            lambda: self._fetch(endpoint, params),
+            lambda: self._fetch(endpoint, params, bypass_daily_gate=bypass_daily_gate),
             should_cache=self._is_cacheable,
         )
 
@@ -290,15 +461,20 @@ class TennisAPIHandler:
 
         return result
 
-    async def _fetch(self, endpoint: str, params: Dict) -> Dict:
+    async def _fetch(self, endpoint: str, params: Dict, bypass_daily_gate: bool = False) -> Dict:
         """Perform one live request, gated by the daily quota and minute rate.
 
         Order matters: a known daily exhaustion short-circuits before the
         minute limiter, and both short-circuit before the network, so neither a
         drained day nor a spent minute costs a request or an upstream round
         trip.
+
+        `bypass_daily_gate=True` skips only the daily short-circuit — the free
+        `/usage` read must reach the API even while parked, because it is the
+        only way to check the local park against the real count. The minute
+        limiter still applies: it is a live request.
         """
-        if self._daily_is_exhausted():
+        if not bypass_daily_gate and self._daily_is_exhausted():
             reset = self._daily_exhausted_until
             return {
                 "success": False,
@@ -341,21 +517,45 @@ class TennisAPIHandler:
                 error_text = await response.text()
 
                 if response.status == 429:
-                    # A daily-limit 429 parks the key until reset; a per-minute
-                    # burst is already handled by the bucket above, so treat a
-                    # 429 that slips through as the daily limit.
-                    self._mark_daily_exhausted()
-                    logger.warning("Live Tennis API 429: %s", error_text)
+                    # The local minute bucket starts full, so a 429 here does
+                    # NOT prove the day is drained — a restart or a second
+                    # client on the same key produces a MINUTE-scale 429 the
+                    # bucket never saw. Classify before parking: only a genuine
+                    # daily 429 calls _mark_daily_exhausted(); a minute burst is
+                    # a minute back-off that leaves the daily quota untouched.
+                    classification = _classify_rate_limit(response.headers, error_text)
+                    logger.warning(
+                        "Live Tennis API 429 (%s): %s",
+                        classification["signal"],
+                        error_text,
+                    )
+                    if classification["scale"] == "daily":
+                        self._mark_daily_exhausted()
+                        return {
+                            "success": False,
+                            "error": "Live Tennis API daily quota limit hit (429)",
+                            "details": error_text,
+                            "quota": {
+                                "daily_exhausted": True,
+                                "resets_at": self._daily_exhausted_until.isoformat()
+                                if self._daily_exhausted_until
+                                else None,
+                            },
+                        }
+
+                    # Minute-scale: align the local bucket with the API's view
+                    # so we stop hammering, but leave the daily quota alone.
+                    retry_after = classification["retry_after_seconds"]
+                    self._bucket.penalize(retry_after or 0.0)
+                    hint = self._bucket.retry_after()
+                    if retry_after is not None:
+                        hint = max(hint, round(float(retry_after), 1))
                     return {
                         "success": False,
-                        "error": "Live Tennis API rate/quota limit hit (429)",
+                        "error": "Live Tennis API per-minute rate limit hit (429)",
                         "details": error_text,
-                        "quota": {
-                            "daily_exhausted": True,
-                            "resets_at": self._daily_exhausted_until.isoformat()
-                            if self._daily_exhausted_until
-                            else None,
-                        },
+                        "rate_limited": True,
+                        "retry_after_seconds": hint,
                     }
 
                 if response.status in (401, 403):
@@ -448,9 +648,15 @@ class TennisAPIHandler:
         """Read the free-tier `/usage` endpoint and fold it into tracked quota.
 
         `/usage` is itself free and does not spend the daily allowance, so this
-        can be called to refresh the numbers get_quota_status() reports.
+        can be called to refresh the numbers get_quota_status() reports — and,
+        critically, to recover from a wrong daily park. It therefore bypasses
+        the daily short-circuit (otherwise the one call that could correct a bad
+        park would be blocked by that very park) and is cached under its own
+        short `usage` TTL so recovery is never answered from a stale `live`
+        cache. A positive remaining in the response clears the park, via
+        _record_usage.
         """
-        result = await self._make_request("/usage", cache_kind="live")
+        result = await self._make_request("/usage", cache_kind="usage", bypass_daily_gate=True)
         if result.get("success"):
             data = result.get("data")
             if isinstance(data, dict):

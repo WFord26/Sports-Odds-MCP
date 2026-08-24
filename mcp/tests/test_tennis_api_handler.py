@@ -22,6 +22,8 @@ from sports_api.tennis_api_handler import (
     TokenBucket,
     derive_break_point,
     _next_utc_midnight,
+    _classify_rate_limit,
+    _parse_retry_after,
 )
 
 TENNIS_URL_RE = re.compile(r"^https://api\.livetennisapi\.com/.*")
@@ -274,6 +276,201 @@ class TestDailyQuota:
 
         assert handler._daily_is_exhausted() is True
         await handler.close()
+
+
+class TestClassifyRateLimit:
+    """FIX 1 — a 429 is minute-scale unless something says otherwise."""
+
+    def test_ambiguous_429_defaults_to_minute(self):
+        # No headers, generic body: must NOT be read as daily exhaustion.
+        c = _classify_rate_limit({}, "429 Too Many Requests")
+        assert c["scale"] == "minute"
+
+    def test_empty_body_and_headers_defaults_to_minute(self):
+        c = _classify_rate_limit(None, "")
+        assert c["scale"] == "minute"
+        assert c["signal"] == "default-minute"
+
+    def test_daily_body_wording_is_daily(self):
+        assert _classify_rate_limit({}, "Daily limit exceeded")["scale"] == "daily"
+        assert _classify_rate_limit({}, "quota exceeded for today")["scale"] == "daily"
+        assert _classify_rate_limit({}, "100 requests/day cap reached")["scale"] == "daily"
+
+    def test_minute_body_wording_is_minute(self):
+        assert _classify_rate_limit({}, "Per-minute rate limit exceeded")["scale"] == "minute"
+        assert _classify_rate_limit({}, "Slow down")["scale"] == "minute"
+
+    def test_scope_header_minute_beats_daily_body_noise(self):
+        # An explicit scope header is the strongest signal.
+        c = _classify_rate_limit({"X-RateLimit-Scope": "minute"}, "daily-ish text")
+        assert c["scale"] == "minute"
+
+    def test_scope_header_daily(self):
+        assert _classify_rate_limit({"RateLimit-Scope": "day"}, "")["scale"] == "daily"
+
+    def test_day_remaining_zero_is_daily(self):
+        c = _classify_rate_limit({"X-RateLimit-Remaining-Day": "0"}, "")
+        assert c["scale"] == "daily"
+
+    def test_minute_remaining_zero_with_day_left_is_minute(self):
+        c = _classify_rate_limit(
+            {"X-RateLimit-Remaining-Minute": "0", "X-RateLimit-Remaining-Day": "58"}, ""
+        )
+        assert c["scale"] == "minute"
+
+    def test_headers_are_case_insensitive(self):
+        c = _classify_rate_limit({"x-ratelimit-remaining-day": "0"}, "")
+        assert c["scale"] == "daily"
+
+    def test_large_retry_after_is_daily(self):
+        c = _classify_rate_limit({"Retry-After": "3600"}, "")
+        assert c["scale"] == "daily"
+        assert c["retry_after_seconds"] == 3600.0
+
+    def test_short_retry_after_is_minute(self):
+        c = _classify_rate_limit({"Retry-After": "12"}, "")
+        assert c["scale"] == "minute"
+        assert c["retry_after_seconds"] == 12.0
+
+
+class TestParseRetryAfter:
+    def test_delta_seconds(self):
+        assert _parse_retry_after("30") == 30.0
+
+    def test_absent(self):
+        assert _parse_retry_after(None) is None
+        assert _parse_retry_after("") is None
+
+    def test_http_date(self):
+        now = datetime(2026, 5, 31, 12, 0, 0, tzinfo=timezone.utc)
+        secs = _parse_retry_after("Sun, 31 May 2026 12:01:00 GMT", now=now)
+        assert secs == 60.0
+
+
+class TestMinuteScale429DoesNotPark:
+    """FIX 1 — a minute-scale 429 must NOT park the daily quota."""
+
+    @pytest.mark.asyncio
+    async def test_minute_429_reports_rate_limited_and_leaves_daily_unparked(self, handler):
+        with aioresponses() as mocked:
+            mocked.get(
+                TENNIS_URL_RE,
+                status=429,
+                headers={"X-RateLimit-Scope": "minute", "Retry-After": "20"},
+                body="per-minute rate limit",
+            )
+            result = await handler.get_live_matches()
+
+        assert result["success"] is False
+        assert result["rate_limited"] is True
+        assert result["retry_after_seconds"] >= 20
+        # The daily quota must remain untouched: no park, no daily short-circuit.
+        assert handler._daily_exhausted_until is None
+        assert handler._daily_is_exhausted() is False
+        assert "quota" not in result
+        await handler.close()
+
+    @pytest.mark.asyncio
+    async def test_minute_429_drains_bucket_so_next_call_is_local(self, handler):
+        # After a minute-scale 429 the local bucket is drained, so the very next
+        # call is denied locally without a second upstream request. Only one 429
+        # is registered; a second network hit would raise.
+        with aioresponses() as mocked:
+            mocked.get(
+                TENNIS_URL_RE,
+                status=429,
+                headers={"X-RateLimit-Scope": "minute"},
+                body="per-minute rate limit",
+            )
+            first = await handler.get_live_matches()
+            second = await handler.get_live_matches()
+
+        assert first["rate_limited"] is True
+        assert second["rate_limited"] is True
+        assert second["retry_after_seconds"] > 0
+        # Still not a daily park.
+        assert handler._daily_exhausted_until is None
+        await handler.close()
+
+    @pytest.mark.asyncio
+    async def test_daily_429_still_parks(self, handler):
+        with aioresponses() as mocked:
+            mocked.get(
+                TENNIS_URL_RE,
+                status=429,
+                headers={"X-RateLimit-Remaining-Day": "0"},
+                body="daily quota exceeded",
+            )
+            result = await handler.get_live_matches()
+
+        assert result["success"] is False
+        assert result["quota"]["daily_exhausted"] is True
+        assert handler._daily_exhausted_until is not None
+        await handler.close()
+
+
+class TestTokenBucketPenalize:
+    def test_penalize_drains_to_empty(self):
+        bucket = TokenBucket(rate_per_minute=60, capacity=10, time_func=lambda: 1000.0)
+        assert bucket.acquire() is True
+        bucket.penalize()
+        assert bucket.acquire() is False
+
+    def test_penalize_with_seconds_holds_empty_longer(self):
+        now = {"t": 1000.0}
+        bucket = TokenBucket(rate_per_minute=60, capacity=10, time_func=lambda: now["t"])
+        # 60/min == 1 token/sec. Penalize for 5s -> ~5s until the first token.
+        bucket.penalize(5.0)
+        assert bucket.retry_after() >= 5.0
+        now["t"] += 6.0
+        assert bucket.acquire() is True
+
+
+class TestUsageRecovery:
+    """FIX 2 — /usage bypasses the daily gate, clears the park, is short-TTL."""
+
+    def test_usage_ttl_is_short_and_independent_of_live(self):
+        # Even when the live TTL is raised to the 900s survival knob, /usage
+        # keeps its own short TTL so a recovery read is never stale.
+        handler = TennisAPIHandler(api_key="twjp_test_key", ttls={"live": 900})
+        assert handler.ttls["live"] == 900
+        assert handler.ttls["usage"] == 15
+        assert handler.ttls["usage"] < handler.ttls["live"]
+
+    @pytest.mark.asyncio
+    async def test_usage_reaches_api_while_daily_parked(self, handler):
+        # Park the key as if a 429 exhausted the day...
+        handler._mark_daily_exhausted()
+        assert handler._daily_is_exhausted() is True
+
+        # ...a normal call short-circuits locally (no upstream needed)...
+        parked = await handler.get_live_matches()
+        assert "Daily request quota exhausted" in parked["error"]
+
+        # ...but /usage still reaches the API and reports real headroom, which
+        # clears the park. Only the /usage response is registered; if the daily
+        # gate had blocked it, no network call would occur and remaining would
+        # never be read.
+        usage_envelope = {"data": {"requests_remaining": 63, "daily_limit": 100}}
+        with aioresponses() as mocked:
+            mocked.get(TENNIS_URL_RE, payload=usage_envelope, status=200)
+            result = await handler.get_usage()
+
+        assert result["success"] is True
+        assert handler._daily_is_exhausted() is False
+        assert handler._daily_exhausted_until is None
+        await handler.close()
+
+    @pytest.mark.asyncio
+    async def test_positive_remaining_clears_park(self, handler):
+        handler._mark_daily_exhausted()
+        handler._record_usage({"requests_remaining": 42, "daily_limit": 100})
+        assert handler._daily_is_exhausted() is False
+
+    @pytest.mark.asyncio
+    async def test_zero_remaining_still_parks(self, handler):
+        handler._record_usage({"requests_remaining": 0, "daily_limit": 100})
+        assert handler._daily_is_exhausted() is True
 
 
 class TestQuotaStatus:
